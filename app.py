@@ -7,7 +7,8 @@ on behalf of password-authenticated admin sessions.
 
 Env vars (set in the Render dashboard, never in chat or in this repo):
   GITHUB_TOKEN    - a classic GitHub token with `repo` scope on the site repo
-  ADMIN_PASSWORD  - the password for the admin lock screen
+  ADMIN_PASSWORD  - the initial admin password; after the first change in the
+                    admin area, a salted hash in data/admin-auth.json takes over
 
 Public endpoints: /health, /api/login
 Everything else requires the X-Admin-Session header from /api/login.
@@ -38,6 +39,9 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 # Only these repo files may be read/written through the proxy.
 ALLOWED_FILES = ("data/galleries.json", "data/site-config.json")
+# Salted password hash lives here once the password is changed in the admin
+# area. Until then, the ADMIN_PASSWORD env var is the password.
+AUTH_FILE = "data/admin-auth.json"
 UPLOAD_RE = re.compile(r"img/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+\.(jpg|jpeg|png|webp)")
 
 app = Flask(__name__)
@@ -45,6 +49,34 @@ CORS(app, origins=[ALLOWED_ORIGIN])
 
 _sessions = {}        # session token -> expiry timestamp
 _login_attempts = {}  # ip -> [timestamps]
+_auth = {"salt": None, "hash": None, "mode": None}  # effective password
+
+
+def hash_password(pw, salt):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt), 260_000).hex()
+
+
+def verify_password(pw):
+    if not _auth["hash"] or not isinstance(pw, str) or not pw:
+        return False
+    return hmac.compare_digest(hash_password(pw, _auth["salt"]), _auth["hash"])
+
+
+def load_auth():
+    """Pick up the password: repo hash file wins, else the env var."""
+    s, d = gh(f"/repos/{OWNER}/{REPO}/contents/{AUTH_FILE}")
+    if s == 200:
+        try:
+            payload = json.loads(base64.b64decode(d["content"]).decode("utf-8"))
+            if payload.get("salt") and payload.get("hash"):
+                _auth.update(salt=payload["salt"], hash=payload["hash"], mode="repo")
+                return
+        except Exception:
+            pass
+    if ADMIN_PASSWORD:
+        salt = secrets.token_hex(16)
+        _auth.update(salt=salt, hash=hash_password(ADMIN_PASSWORD, salt), mode="env")
+    # else: no password configured yet -> nobody can log in
 
 
 def gh(path, method="GET", payload=None):
@@ -81,7 +113,7 @@ def health():
     return jsonify({
         "ok": True,
         "github_connected": bool(GITHUB_TOKEN),
-        "password_set": bool(ADMIN_PASSWORD),
+        "password_set": bool(_auth["hash"]),
     })
 
 
@@ -97,11 +129,32 @@ def login():
 
     data = request.get_json(force=True, silent=True) or {}
     pw = data.get("password", "")
-    if ADMIN_PASSWORD and hmac.compare_digest(pw, ADMIN_PASSWORD):
+    if verify_password(pw):
         tok = secrets.token_urlsafe(32)
         _sessions[tok] = now + SESSION_TTL
         return jsonify({"ok": True, "session": tok})
     return jsonify({"error": "Wrong password."}), 401
+
+
+@app.route("/api/change-password", methods=["POST"])
+@require_session
+def change_password():
+    data = request.get_json(force=True, silent=True) or {}
+    new = data.get("new", "")
+    if not isinstance(new, str) or len(new) < 6:
+        return jsonify({"error": "Use at least 6 characters."}), 400
+    salt = secrets.token_hex(16)
+    payload = {"salt": salt, "hash": hash_password(new, salt)}
+    content = base64.b64encode((json.dumps(payload, indent=2) + "\n").encode()).decode()
+    s, cur = gh(f"/repos/{OWNER}/{REPO}/contents/{AUTH_FILE}")
+    body = {"message": "Admin: change password", "content": content}
+    if s == 200 and cur.get("sha"):
+        body["sha"] = cur["sha"]
+    s, d = gh(f"/repos/{OWNER}/{REPO}/contents/{AUTH_FILE}", "PUT", body)
+    if s not in (200, 201):
+        return jsonify({"error": "Could not save. Try again."}), 502
+    _auth.update(salt=salt, hash=payload["hash"], mode="repo")
+    return jsonify({"ok": True})
 
 
 @app.route("/api/file/<path:name>", methods=["GET"])
@@ -155,3 +208,6 @@ def upload():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+else:
+    # gunicorn path: load the effective password once per worker
+    load_auth()
